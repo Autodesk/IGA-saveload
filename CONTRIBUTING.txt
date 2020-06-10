@@ -1,0 +1,6 @@
+If you wish to contribute changes to this project, you will need to sign our
+contributor license agreement. You may find the agreement in the doc/ folder;
+use IGA-saveload-individual-contributor-agreement.docx if you are contributing
+as an individual, or IGA-saveload-corporate-contributor-agreement.docx if you
+are contributing on behalf of a company. Information about where to send your
+signed agreement is contained within those documents.
