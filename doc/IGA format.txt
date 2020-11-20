@@ -1,0 +1,268 @@
+IGA format
+=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+
+The IGA file format is an extension of the TSS format, which itself is
+designed as an easy format for storing tagged binary blobs. Every TSS/IGA
+file consists of an 8-byte header:
+
+"#TSS0001"
+
+This is followed by some number of blocks. The format of a block is as
+follows:
+
+"\nBLOCK:\n"   // 8 bytes
+char tag[8];   // 8 bytes, designates the block's type.
+uint64_t id;   // 8 bytes, either 0 or a unique integer
+uint64_t len;  // 8 bytes, length of data block
+char data[len] // The length of this block is the value read for 'len'
+uint64_t len;  // 8 bytes, repeats the length
+
+All numbers are little endian, to make x64 implementation easier. If you are
+on a big-endian architecture, you'll need to do byte-swapping. The 'len' tag
+is referred to in most blocks when determining the number of entries in the
+block. Within blocks, double refers to 64 bit floating point values using
+the IEEE 754 format.
+
+The 'id' tag is primarily used when the blocks in a file need to refer to
+each other. It is not expected to be used by this file format, but you should
+not require that it be 0, in case future revisions of the format need it, so
+that you can be forward-compatible with those future revisions.
+
+Immediately after the final block, the file ends. The most important field
+here is the tag, which specifies how the data ought to be interpreted. If an
+unrecognized tag is encountered, it should be silently skipped; this is the
+primary mechanism for allowing upgrades to the file format while still
+letting older software read files produced by newer versions. For more
+information about TSS files, their design goals, and their (optional) index
+blocks, we have a TSS format document elsewhere.
+
+You can tell that a given TSS file is an IGA file because the first 48
+bytes will be as follows:
+
+"#TSS0001\nBLOCK:\nIGAFILE\n\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+
+In other words, the first block will be empty and will have the tag
+"IGAFILE\n". You may treat this as a fixed 48-byte header, or you may treat
+it as a handled block type, depending on your implementation constraints.
+
+The header block will be followed by other blocks. The currently supported
+block types are listed below. While our initial implementation only expects
+to support one model per file, this format is intentionally described in a way
+that will potentially allow multiple models per file, stored one after
+another.
+
+The next section describes the supported block types. It is intended that all
+of these blocks can be read using a single, large read operation directly into
+an appropriate data structure (a vector of structs), which should help with
+the performance of read & write operations. These structures are expected to
+be tightly packed, with no padding bytes needed to deal with alignment issues;
+in some cases, this has required splitting certain data types between
+different blocks. It is recommended that you read the file into the data
+structures as described, and then rearrange it as desired. The name in quotes
+("SRFTYPE\n") is the exact sequence of 8 bytes used to describe the block
+type. For ease of reading, blocks of a given type are later referred to using
+just the alphanumeric portion of the name (SRFTYPE).
+
+==============================================================================
+"SRFTYPE\n"
+==============================================================================
+
+This block contains a null-terminated string giving the surface type. For a
+T-Spline surface with G0 caps, this block will contain "tspline-g0". For a
+T-Spline surace with G1 caps, this block will contain "tspline-g1". Other
+surface types may become supported in the future.
+
+We may eventually wish to store more than one surface per file. If this
+becomes desirable, each surface will begin with a "SRFTYPE\n" block, and
+any dictionaries from the prior surface should be discarded before loading
+the next one.
+
+==============================================================================
+"VECDICT\n"
+==============================================================================
+
+A dictionary that contains vectors of coefficients. The dictionary is treated
+as a jagged 2-dimensional array, that is, an array of arrays, where each inner
+array may be of a different length. The structure of this block is
+straightforward:
+
+double coeff_vec[ len / sizeof( double ) ];
+
+The individual "inner" arrays have lengths which are determined by the the
+2DPIECE block.
+
+==============================================================================
+"PT3DW--\n"
+==============================================================================
+
+Provides the control points.
+
+struct Point3d { double x, y, z, w; }
+Point3d point_vec[ len / sizeof( Point3d ) ];
+
+The control points are stored as x y z w groups. The weights are multiplied in
+so the Cartesian position of each point is x/w, y/w, z/w.
+
+==============================================================================
+"2DPIECE\n"
+==============================================================================
+
+Given this struct:
+struct Piece2D
+{
+	uint32_t st_order;
+	uint32_t s_index;
+	uint32_t maybe_t_index;
+	uint32_t pt_index;
+};
+
+We store this data:
+Piece2D piece_vec[ len / sizeof( Piece2D ) ];
+
+Each entry is used to store a single piece of influence from a single control
+point over a single element. This influence is always a grid of coefficients,
+but there are two possible ways for this grid to be stored--it may be stored
+as the tensor product of two coefficient vectors, or it may be an explicit
+2-dimensional grid of coefficients.
+
+The full 2DPIECE block is a jagged 2-dimensional array--that is, an array of
+arrays, where each of the inner arrays may be of a different length. Each
+inner array contains every piece of influence for a given element. In order to
+determine where each inner array starts and begins, use the indexing data from
+the SHAPE block.
+
+The s_order of the grid is stored in the lower 16 bits of st_order, and the
+t_order of the grid is store in the upper 16 bits of st_order. In other words,
+
+uint16_t s_order = st_order & 0xFFFF;
+uint16_t t_order = (st_order >> 16) & 0xFFFF;
+
+The pt_index is an index into the most recent PT3DW block, and gives the
+geometric position of the control point.
+
+To retrieve the value of the coefficients, we use the most recent VECDICT
+block (in a valid file, a VECDICT block must occur before the 2DPIECE block).
+
+To determine whether this entry is tensor product or explicit, examine the
+value in maybe_t_index. If it is ~0u (that is, 0xFFFFFFFF), then this is an
+explicit element. If it is any other value, then this is a tensor product
+element.
+
+For an explicit element, the s_index gives the position in coeff_vec[] (i.e.
+the data in the VECDICT block) of the start of a vector that is
+(s_order*t_order) elements long. The coefficient at (s,t) in the explicit grid
+can be retrieved using
+
+coeff_vec[ s_index + (s + t * s_order) ];
+
+For a tensor product element, the grid is the product of two vectors. The
+vector of s coefficients starts at coeff_vec[ s_index ] and contains s_order
+entries. The vector of t coefficients starts at coeff_vec[ maybe_t_index ] and
+contains t_order entries. The entry at (s,t) in the final grid is determined
+using the tensor product as follows:
+
+coeff_vec[ s_index + s ] * coeff_vec[ maybe_t_index + t ]
+
+==============================================================================
+"LAYOUT-\n"
+==============================================================================
+
+struct FaceLayout
+{
+	uint32_t side_range[ 5 ]
+}
+FaceLayout face_vec[ len / sizeof(FaceLayout) ];
+
+A list of face layouts. Every face in the model has four sides, and this gives
+patterns for how many patches are touching on each side. All patches are four-
+sided, but due to the potential for T-junctions, it's possible that a given
+side may be shared with more than one other patch, and that a patch may
+therefore have more than four edges. By convention, side 0 is the 'bottom',
+side 1 the 'right', side 2 the 'top', and side 3 the 'left.' It probably makes
+no difference, however, as long as you're consistent.
+
+The first entry (face_vec[0]) is always { 0, 1, 2, 3, 4 }, which is to say one
+patch on each side of the face. For surfaces that have no T-junctions between
+elements, this will also be the only pattern. These values are treated in a
+manner similar to a knot vector, and are intended to provide convenience in
+indexing. To determine the number of patches on a given 'side', use the
+formula
+
+side_range[ side + 1 ] - side_range[ side ].
+
+The total number of edges on a face is stored in side_range[4]. When indexing
+into the EDGES, if you wish to get get edge 'i' from 'side', the index is
+
+side_range[ side ] + i
+
+==============================================================================
+"EDGES--\n"
+==============================================================================
+
+This is a jagged 2-dimensional array (array of arrays, with each sub-array
+having a different length) represented as a one dimensional array. To get the
+starts and lengths of each sub-array, look at the SHAPE block.
+
+uint32_t edge_vec[ len / sizeof( uint32_t ) ];
+
+Each entry in this array refers to a different adjacent patch. The indices
+themselves refer to entries in the SHAPE block's vector. In other words, every
+element (entry in the SHAPE block) has a list of all the surrounding elements
+(stored here).
+
+If the shape has open edges then the value stored here will be ~0u
+(0xFFFFFFFF), which we refer to as the INVALID_INDEX.
+
+==============================================================================
+"KNOTINT\n"
+==============================================================================
+
+This block has the same number of entries as EDGES and is indexed parallel to
+it. As a future extension, we may allow omission of this block, in which case
+you may assume every knot interval is 1.0.
+
+double interval_vec[ len / sizeof( double ) ];
+
+==============================================================================
+"SHAPE--\n"
+==============================================================================
+
+struct Elem
+{
+	uint32_t piece_end_index; // Index into the 2DPIECE block
+	uint32_t layout_index;    // Index into LAYOUT block
+	uint32_t edge_end_index;  // Indexes into EDGES and KNOTINT blocks.
+}
+Elem elem_vec[ len / sizeof( Elem ) ];
+
+Every entry is an element, and contains the necessary information to determine
+the shape and topological structure for that element. The indices here refer
+to three different jagged arrays: the pieces of influence (2DPIECE), adjacent
+elements (EDGES) and the lengths of each edge (KNOTINT). The layout_index
+refers to the face layout, which isn't jagged, but it does tell you which
+sides the edges belong to. To get the full range of a sub-array within a
+jagged array, you have to look at the prior block as well. If we can imagine
+an elem_vec[-1] = { 0, 0, 0 }, the range of vectors for element i is:
+
+vector< uint32_t > pieces(
+	&piece_vec[ entries[i-1].piece_end_index ],
+	&piece_vec[ entries[ i ].piece_end_index ] );
+
+vector< uint32_t > edges(
+	&edge_vec[ entries[i-1].edge_end_index ],
+	&edge_vec[ entries[ i ].edge_end_index ] );
+
+vector< uint32_t > intervals(
+	&interval_vec[ entries[i-1].edge_end_index ],
+	&interval_vec[ entries[ i ].edge_end_index ] );
+
+All such elements together make up the entire surface for analysis.
+
+==============================================================================
+
+Some notes on optional blocks: You are likely to see either a TSM or a TSMZ
+block in files produced by Fusion 360. This is provided for convenience, and
+contains the TSM file (or zlib-compressed TSM file in the case of TSMZ) which
+generated the given elements. Further, most TSS files contain an INDEX block,
+which, when present, is always the final block in the file, and provides
+an index of the types, IDs, and positions of every other block in the file.
